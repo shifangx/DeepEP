@@ -57,16 +57,42 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
   return b;
 }
 
-// float to e2m1 4bit (sign:1, exp:2, mantissa:1) quantization
+// Convert 1 float value into 1 e2m1 value (represented as one uint8_t).
 __device__ inline uint8_t float_to_e2m1(float f) {
     // Get sign
     uint8_t sign = (f < 0);
+    int exp = 0;
+    int mant = 0;
     float abs_f = fabsf(f);
-    float abs_f_log2 = log2f(abs_f);
-    // map float to 2-bit exponent
-    int exp = static_cast<int>(floorf(abs_f_log2 + 1));
-    // Take one bit for mantissa
-    uint8_t mant = (abs_f_log2 + 1 - exp > 0.5f) ? 1 : 0;
+    if (abs_f < 1.0) {
+        exp = 0;
+        if (abs_f < 0.5) {
+            mant = 0;
+        } else {
+            mant = 1;
+        }
+    } else if (abs_f < 2.0) {
+        exp = 1;
+        if (abs_f < 1.5) {
+            mant = 0;
+        } else {
+            mant = 1;
+        }
+    } else if (abs_f < 4.0) {
+        exp = 2;
+        if (abs_f < 3.0) {
+            mant = 0;
+        } else {
+            mant = 1;
+        }
+    } else {
+        exp = 3;
+        if (abs_f < 5.0) {
+            mant = 0;
+        } else {
+            mant = 1;
+        }
+    }
     return (sign << 3) | (exp << 1) | mant;
 }
 
@@ -95,42 +121,10 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         #pragma message("warning: this architecture does not support cvt.rn.satfinite.e2m1x2.f32, use float_to_e2m1 instead.")
     #endif
     uint32_t val = 0;
-    float* data = reinterpret_cast<float*>(&array[0]);
-    for (int i = 0; i < 8; ++i) {
-        val |= (float_to_e2m1(data[i]) & 0xF) << (4 * i);
-    }
-    return val;
-  #endif
-}
-
-// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
-inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    uint32_t val;
-    asm volatile(
-        "{\n"
-        ".reg .b8 byte0;\n"
-        ".reg .b8 byte1;\n"
-        ".reg .b8 byte2;\n"
-        ".reg .b8 byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-        "}"
-        : "=r"(val)
-        : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
-          "f"(array[6]), "f"(array[7]));
-    return val;
-  #else
-    #if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
-        #pragma message("warning: this architecture does not support cvt.rn.satfinite.e2m1x2.f32, use float_to_e2m1 instead.")
-    #endif
-    uint32_t val = 0;
-    float* data = reinterpret_cast<float*>(&array[0]);
-    for (int i = 0; i < 8; ++i) {
-        val |= (float_to_e2m1(data[i]) & 0xF) << (4 * i);
+    float2* data = reinterpret_cast<float2*>(&array[0]);
+    for (int i = 0; i < 4; ++i) {
+        val |= (float_to_e2m1(data[i].x) & 0xFF) << (8 * i);
+        val |= (float_to_e2m1(data[i].y) & 0xFF) << (8 * i + 4);
     }
     return val;
   #endif
@@ -299,7 +293,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
                 }
             }
 
-            // FP8 cast
+            // FP8 or NVFP4 cast
             EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
             #pragma unroll
             for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
@@ -341,8 +335,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
 
                     // Write scale to send buffer
                     if (lane_id % 2 == 0){
-                        EP_DEVICE_ASSERT((i * kNumElemsPerRead) % 16 == 0);
-                        int rdma_x_scale_idx = i * kNumElemsPerRead / 16;
+                        EP_DEVICE_ASSERT((i * kNumElemsPerRead) % kNumPerChannels == 0);
+                        int rdma_x_scale_idx = i * kNumElemsPerRead / kNumPerChannels;
                         rdma_x_scales[rdma_x_scale_idx] = sf_val;                   
                         }
                     // Cast into send buffer                    
@@ -543,19 +537,21 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
             } else if constexpr (kUseNVFP4) {            
-                // Equivalent CuTe layout:
-                //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
+                 // The physical layout is (l, rm, rk, 32, 4, 4).
                 const auto src_scales = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
-                const auto token_stride = num_elems_per_pack;
-                const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
+                const auto token_stride = num_scales * sizeof(scale_t);
+                const auto pack_stride = num_elems_per_pack;
+                const auto rm = token_idx / 128;
+                const auto rm_res = token_idx % 128;
                 #pragma unroll
                 for (int j = lane_id; j < num_scales; j += 32) {
                     const auto pack_idx = j / num_elems_per_pack;
                     const auto elem_idx = j % num_elems_per_pack;
                     auto scale = ld_nc_global(src_scales + j);
-                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;                   
+                    // recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;                   
+                    recv_x_scales[rm * token_stride * 128 + pack_idx * pack_stride * 128 + rm_res * pack_stride + elem_idx] = scale;                   
                 }
             }
         }

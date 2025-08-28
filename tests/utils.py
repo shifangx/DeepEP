@@ -79,7 +79,7 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
 
     result = []
     for i in range(8):
-        shift = (7 - i) * 4
+        shift = i * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
         result.append(val)
