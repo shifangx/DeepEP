@@ -54,48 +54,40 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             for dispatch_data_type in ('bf16', 'fp8', 'nvfp4'):
                 dispatch_use_fp8 = dispatch_data_type == 'fp8'
                 dispatch_use_nvfp4 = dispatch_data_type == 'nvfp4'
-                use_ue8m0_for_nvfp4_sf = False
+                use_ue8m0_for_sf = False
                 for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
-                            max_val = torch.max(torch.abs(current_x), dim=1).values
-                            x_sf_scale = (MAX_E4M3 * MAX_NVFP4) / max_val.to(torch.float32)
+                            x_max = torch.max(torch.abs(current_x))
+                            dist.all_reduce(x_max, op=dist.ReduceOp.MAX, group=group)
+                            x_sf_scale = (MAX_E4M3 * MAX_NVFP4) / x_max.to(torch.float32)
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
-                                                            use_nvfp4=dispatch_use_nvfp4, use_ue8m0_for_nvfp4_sf=use_ue8m0_for_nvfp4_sf,
+                                                            use_nvfp4=dispatch_use_nvfp4, use_ue8m0_for_sf=use_ue8m0_for_sf,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                                             x_sf_scale=x_sf_scale,
                                                             async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
                             hook() if return_recv_hook else event.current_stream_wait()
                         if dispatch_use_fp8:
                             packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous())
+                            simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape)
                         elif dispatch_use_nvfp4:
                             recv_x_scale_view = packed_recv_x[1]
                             recv_x_scale_view = recv_x_scale_view.permute(5, 2, 0, 1, 4, 3)
                             recv_x_scale_view = recv_x_scale_view.contiguous().view(num_local_experts, int(num_ranks * num_tokens), hidden // 16)
-                            packed_recv_x = (packed_recv_x[0], recv_x_scale_view, packed_recv_x[2].contiguous())
+                            packed_recv_x = (packed_recv_x[0], recv_x_scale_view)
+                            simulated_gemm_x = per_token_cast_back(packed_recv_x[0], packed_recv_x[1], x_sf_scale, use_ue8m0_for_sf=use_ue8m0_for_sf, src_data_format='nvfp4')
                         else:
                             packed_recv_x = packed_recv_x
-
-                        if dispatch_use_fp8:
-                            simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape)
-                        elif dispatch_use_nvfp4:
-                            simulated_gemm_x = per_token_cast_back(packed_recv_x[0], packed_recv_x[1], packed_recv_x[2], src_data_format='nvfp4', use_ue8m0_for_nvfp4_sf=use_ue8m0_for_nvfp4_sf)
-                        else:
                             simulated_gemm_x = packed_recv_x.clone()
                         all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
                         dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
                         for i in range(num_local_experts if do_check else 0):
                             expert_id = rank * num_local_experts + i
-                            if dispatch_use_fp8:
-                                recv_x = per_token_cast_back(packed_recv_x[0][i], packed_recv_x[1][i])
-                            elif dispatch_use_nvfp4:
-                                recv_x = per_token_cast_back(packed_recv_x[0][i], packed_recv_x[1][i], packed_recv_x[2][i], src_data_format='nvfp4', use_ue8m0_for_nvfp4_sf=use_ue8m0_for_nvfp4_sf)
-                            else:
-                                recv_x = packed_recv_x[i]
+                            recv_x = simulated_gemm_x[i]
                             recv_count, recv_src_info, recv_layout_range = packed_recv_count[i], handle[0][i], handle[1][i]
 
                             # Check expert indices
@@ -115,9 +107,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 recv_src_info = recv_src_info[:num_valid_tokens]
                                 assert torch.equal(recv_x_amin, recv_x_amax), f'recv_x_amin: {recv_x_amin}, recv_x_amax: {recv_x_amax}'
                                 diff = calc_diff(recv_x[:, -1], recv_src_info.view(-1))
-                                if dispatch_use_nvfp4:
-                                    assert diff < 0.007, f"rank {rank}, num_times {num_times}, expert_id: {expert_id}, diff: {diff}"
-                                elif round_scale:
+                                if dispatch_use_nvfp4 or round_scale:
                                     assert diff < 0.007, f"rank {rank}, num_times {num_times}, expert_id: {expert_id}, diff: {diff}"
                                 else:
                                     assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0
@@ -145,11 +135,12 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                             if do_check:
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
                                 assert torch.isnan(combined_x).sum().item() == 0
-                                diff_threshold = 1e-5
                                 if dispatch_use_fp8:
                                     diff_threshold = 9e-4
                                 elif dispatch_use_nvfp4:
                                     diff_threshold = 0.007
+                                else:
+                                    diff_threshold = 1e-5
                                 assert diff < diff_threshold, f'Error: {diff=}, {dispatch_use_fp8=}, {dispatch_use_nvfp4=}, {zero_copy=}'
                                 hash_value ^= hash_tensor(combined_x)
 

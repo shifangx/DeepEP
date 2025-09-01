@@ -90,14 +90,14 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
     return out
 
 
-def cast_nvfp4_to_fp32(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_sf_scale: float, use_ue8m0_for_nvfp4_sf: bool = False):
-    NVFP4_TABLE = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1.0, -1.5, -2, -3, -4, -6], dtype=torch.float32, device='cuda')    
-    if use_ue8m0_for_nvfp4_sf:
+def cast_nvfp4_to_fp32(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_sf_scale: float, use_ue8m0_for_sf: bool = False):
+    assert(x_sf_scale.dim() == 0, f"expect x_sf_scale.dim() == 0, but got {x_sf_scale.dim()}")
+    NVFP4_TABLE = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1.0, -1.5, -2, -3, -4, -6], dtype=torch.float32, device='cuda')
+    if use_ue8m0_for_sf:
         x_scales = x_scales.view(dtype=torch.int8).to(torch.int) << 23
         x_scales = x_scales.view(dtype=torch.float)
     else:
         x_scales = x_scales.view(dtype=torch.float8_e4m3fn).to(torch.float32)
-    x_sf_scale = x_sf_scale.view(*x_sf_scale.shape, 1)
     x_scales = x_scales * (1 / x_sf_scale)
     
     x_int32 = x_nvfp4.view(dtype=torch.int32)
@@ -111,11 +111,11 @@ def cast_nvfp4_to_fp32(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_sf_scale
     return x_fp32
 
 
-def per_token_cast_back(x: torch.Tensor, x_scales: torch.Tensor, x_sf_scale: torch.Tensor = None, src_data_format: str = 'fp8', use_ue8m0_for_nvfp4_sf: bool = False):
+def per_token_cast_back(x: torch.Tensor, x_scales: torch.Tensor, x_sf_scale: torch.Tensor = None, use_ue8m0_for_sf: bool = False, src_data_format: str = 'fp8'):
     if src_data_format == 'fp8':
         return cast_fp8_to_fp32(x, x_scales)
     elif src_data_format == 'nvfp4':
-        return cast_nvfp4_to_fp32(x, x_scales, x_sf_scale, use_ue8m0_for_nvfp4_sf)
+        return cast_nvfp4_to_fp32(x, x_scales, x_sf_scale, use_ue8m0_for_sf)
     else:
         raise ValueError(f"Unsupported src_data_format: {src_data_format}")
 

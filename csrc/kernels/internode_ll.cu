@@ -36,8 +36,6 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
                   clean_0, num_clean_int_0, clean_1, num_clean_int_1);
 }
 
-constexpr int CVT_ELTS_PER_THREAD = 8;
-constexpr int SF_VEC_SIZE = 16;
 
 struct PackedVec {
   __nv_bfloat162 elts[4];
@@ -57,44 +55,32 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
   return b;
 }
 
-// Convert 1 float value into 1 e2m1 value (represented as one uint8_t).
+// Convert 1 float value into one e2m1 value (represented as one uint8_t).
 __device__ inline uint8_t float_to_e2m1(float f) {
     // Get sign
     uint8_t sign = (f < 0);
-    int exp = 0;
-    int mant = 0;
     float abs_f = fabsf(f);
-    if (abs_f < 1.0) {
+    float abs_f_log2 = log2f(abs_f);
+    // map float to 2-bit exponent
+    uint8_t exp, mant;
+    if (abs_f_log2 < 0) {
         exp = 0;
-        if (abs_f < 0.5) {
+        if (abs_f_log2 < -1) {
             mant = 0;
-        } else {
-            mant = 1;
         }
-    } else if (abs_f < 2.0) {
-        exp = 1;
-        if (abs_f < 1.5) {
-            mant = 0;
-        } else {
-            mant = 1;
-        }
-    } else if (abs_f < 4.0) {
-        exp = 2;
-        if (abs_f < 3.0) {
-            mant = 0;
-        } else {
-            mant = 1;
-        }
-    } else {
-        exp = 3;
-        if (abs_f < 5.0) {
-            mant = 0;
-        } else {
+        else {
             mant = 1;
         }
     }
+    else{
+        exp = static_cast<int>(floorf(abs_f_log2 + 1));
+        exp = fminf(exp, 3.0f);
+        mant = (abs_f_log2 + 1 - exp > 0.5f) ? 1 : 0;
+    }
+    // Take one bit for mantissa
     return (sign << 3) | (exp << 1) | mant;
 }
+
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
@@ -130,6 +116,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
   #endif
 }
 
+constexpr int CVT_ELTS_PER_THREAD = 8;
 // Quantizes the provided PackedVec into the uint32_t output
 template <int SF_VEC_SIZE, bool UE8M0_SF>
 __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec& vec, float SFScaleVal, uint8_t* SFout) {
@@ -203,7 +190,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec& vec, float SFScaleVal, uint8
 
 template <bool kUseFP8, bool kUseUE8M0, bool kUseNVFP4, bool kUseUE8M0ForNVFP4SF, int kHidden>
 __global__ __launch_bounds__(1024, 1) void
-dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf_scale,
+dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count,
          int* cumulative_local_expert_recv_stats,
@@ -274,7 +261,6 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
-            const auto rdma_x_sf_scale = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int));
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
             const auto rdma_x_scales = reinterpret_cast<rdma_x_scale_t*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
@@ -283,13 +269,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
             float SFScaleVal = 1.0f;
             if constexpr (kUseNVFP4) {
-                // Get scaling value: if x_sf_scale is nullptr, use 1.0f; otherwise, read value at token_idx
+                // Get scaling value: if x_sf_scale is nullptr, use 1.0f;
                 if (x_sf_scale != nullptr) {
-                    SFScaleVal = *(static_cast<const float*>(x_sf_scale) + token_idx);
-                }
-                // Only thread 0 writes scaling value to rdma_x_sf_scale
-                if (thread_id == 0) {
-                    *rdma_x_sf_scale = SFScaleVal;
+                    SFScaleVal = *(static_cast<const float*>(x_sf_scale));
                 }
             }
 
@@ -331,15 +313,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
                     // Convert to NVFP4
                     uint8_t sf_val;
                     PackedVec vec = *reinterpret_cast<PackedVec*>(&int4_value);
-                    uint32_t result = cvt_warp_fp16_to_fp4<SF_VEC_SIZE, kUseUE8M0ForNVFP4SF>(vec, SFScaleVal, &sf_val);
+                    uint32_t result = cvt_warp_fp16_to_fp4<kNumPerChannels, kUseUE8M0ForNVFP4SF>(vec, SFScaleVal, &sf_val);
 
                     // Write scale to send buffer
                     if (lane_id % 2 == 0){
                         EP_DEVICE_ASSERT((i * kNumElemsPerRead) % kNumPerChannels == 0);
                         int rdma_x_scale_idx = i * kNumElemsPerRead / kNumPerChannels;
-                        rdma_x_scales[rdma_x_scale_idx] = sf_val;                   
+                        rdma_x_scales[rdma_x_scale_idx] = sf_val;
                         }
-                    // Cast into send buffer                    
+                    // Cast into send buffer
                     rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&result);
                 } else {
                     // Reinterpret-cast is for C++14 compatibility
@@ -462,7 +444,6 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
         const auto recv_x_int4 = static_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
-        const auto recv_sf_scale = static_cast<float*>(packed_recv_x_sf_scale) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_scales = align<int>(num_scales, sizeof(float) / sizeof(scale_t));
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
@@ -500,12 +481,6 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
             if (lane_id == 0)
                 recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
-            if constexpr (kUseNVFP4) {
-                const auto src_sf_scale_for_nvfp4 = reinterpret_cast<float*>(rdma_recv_x_uint8 + i * num_bytes_per_msg + sizeof(int));
-                if (lane_id == 0)
-                    recv_sf_scale[recv_token_begin_idx + i] = ld_nc_global(src_sf_scale_for_nvfp4);
-            }
-
             __syncwarp();
 
             // Copy data
@@ -551,7 +526,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
                     const auto elem_idx = j % num_elems_per_pack;
                     auto scale = ld_nc_global(src_scales + j);
                     // recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;                   
-                    recv_x_scales[rm * token_stride * 128 + pack_idx * pack_stride * 128 + rm_res * pack_stride + elem_idx] = scale;                   
+                    recv_x_scales[rm * token_stride * 128 + pack_idx * pack_stride * 128 + rm_res * pack_stride + elem_idx] = scale;
                 }
             }
         }
@@ -559,7 +534,6 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales, void* packed_recv_x_sf
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
-              void* packed_recv_x_sf_scale,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count,
               int* cumulative_local_expert_recv_stats,
@@ -571,7 +545,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
-              bool use_nvfp4, bool use_ue8m0_for_nvfp4_sf,
+              bool use_nvfp4, bool use_ue8m0_for_sf,
               void* workspace, int num_device_sms,
               cudaStream_t stream, int phases) {
     constexpr int kNumMaxTopK = 9;
@@ -599,12 +573,12 @@ if (use_fp8 and not use_ue8m0) \
     dispatch_func = dispatch<true, false, false, false, hidden>; \
 if (use_fp8 and use_ue8m0) \
     dispatch_func = dispatch<true, true, false, false, hidden>; \
-if (use_nvfp4 and not use_ue8m0_for_nvfp4_sf) \
+if (use_nvfp4 and not use_ue8m0_for_sf) \
     dispatch_func = dispatch<false, false, true, false, hidden>; \
-if (use_nvfp4 and use_ue8m0_for_nvfp4_sf) \
+if (use_nvfp4 and use_ue8m0_for_sf) \
     dispatch_func = dispatch<false, false, true, true, hidden>; \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
-              packed_recv_x, packed_recv_x_scales, packed_recv_x_sf_scale, \
+              packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, \
               cumulative_local_expert_recv_stats, \

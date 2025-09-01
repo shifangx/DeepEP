@@ -1087,14 +1087,14 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
 #endif
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
                              const std::optional<torch::Tensor>& x_sf_scale,
                              int num_max_dispatch_tokens_per_rank, int num_experts,
                              bool use_fp8, bool round_scale, bool use_ue8m0,
-                             bool use_nvfp4, bool use_ue8m0_for_nvfp4_sf,
+                             bool use_nvfp4, bool use_ue8m0_for_sf,
                              bool async, bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
@@ -1149,8 +1149,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     // Allocate column-majored scales
     auto packed_recv_x_scales = std::optional<torch::Tensor>();
     void* packed_recv_x_scales_ptr = nullptr;
-    auto packed_recv_x_sf_scale = std::optional<torch::Tensor>();
-    void* packed_recv_x_sf_scale_ptr = nullptr;
     EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
     if (use_fp8) {
@@ -1184,14 +1182,12 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         packed_recv_x_scales = packed_recv_x_scales.value().permute({3, 4, 1, 5, 2, 0});
 
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
-        packed_recv_x_sf_scale = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
-        packed_recv_x_sf_scale_ptr = packed_recv_x_sf_scale->data_ptr();
     }
 
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
-        internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr, packed_recv_x_sf_scale_ptr,
+        internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                                packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
                                packed_recv_count.data_ptr<int>(),
                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
@@ -1204,7 +1200,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
                                use_fp8, round_scale, use_ue8m0,
-                               use_nvfp4, use_ue8m0_for_nvfp4_sf,
+                               use_nvfp4, use_ue8m0_for_sf,
                                workspace, num_device_sms,
                                launch_stream, phases);
     };
@@ -1224,8 +1220,9 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+
     // Return values
-    return {packed_recv_x, packed_recv_x_scales, packed_recv_x_sf_scale, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
+    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
