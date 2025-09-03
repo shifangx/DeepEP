@@ -269,10 +269,9 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
             float SFScaleVal = 1.0f;
             if constexpr (kUseNVFP4) {
-                // Get scaling value: if x_sf_scale is nullptr, use 1.0f;
-                if (x_sf_scale != nullptr) {
-                    SFScaleVal = *(static_cast<const float*>(x_sf_scale));
-                }
+                // Get scaling value;
+                EP_DEVICE_ASSERT(x_sf_scale != nullptr);
+                SFScaleVal = *(static_cast<const float*>(x_sf_scale));
             }
 
             // FP8 or NVFP4 cast

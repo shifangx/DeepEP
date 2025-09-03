@@ -1151,6 +1151,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     void* packed_recv_x_scales_ptr = nullptr;
     EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
+    EP_HOST_ASSERT(not (use_fp8 and use_nvfp4));
     if (use_fp8) {
         // TODO: support unaligned cases
         EP_HOST_ASSERT(hidden % 512 == 0);
@@ -1182,6 +1183,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         packed_recv_x_scales = packed_recv_x_scales.value().permute({3, 4, 1, 5, 2, 0});
 
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
+        EP_HOST_ASSERT(packed_recv_x_scales_ptr != nullptr);
     }
 
     // Kernel launch
