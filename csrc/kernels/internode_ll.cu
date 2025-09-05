@@ -81,10 +81,11 @@ __device__ inline uint8_t float_to_e2m1(float f) {
     return (sign << 3) | (exp << 1) | mant;
 }
 
-
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // PTX instructions used here requires sm100a.
+  #if CUDA_VERSION >= 12080
+  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && __CUDA_ARCH_HAS_FEATURE__(SM100_ALL)
     uint32_t val;
     asm volatile(
         "{\n"
@@ -99,13 +100,16 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
         "}"
         : "=r"(val)
-        : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
-          "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+        : "f"(array[0].x),
+          "f"(array[0].y),
+          "f"(array[1].x),
+          "f"(array[1].y),
+          "f"(array[2].x),
+          "f"(array[2].y),
+          "f"(array[3].x),
+          "f"(array[3].y));
     return val;
   #else
-    #if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
-        #pragma message("warning: this architecture does not support cvt.rn.satfinite.e2m1x2.f32, use float_to_e2m1 instead.")
-    #endif
     uint32_t val = 0;
     float2* data = reinterpret_cast<float2*>(&array[0]);
     for (int i = 0; i < 4; ++i) {
@@ -114,7 +118,8 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
     }
     return val;
   #endif
-}
+  #endif
+  }
 
 constexpr int CVT_ELTS_PER_THREAD = 8;
 // Quantizes the provided PackedVec into the uint32_t output
@@ -195,7 +200,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* packed_recv_count,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
-         const float* x_sf_scale,
+         const float* x_global_scales,
          void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
@@ -270,8 +275,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             float SFScaleVal = 1.0f;
             if constexpr (kUseNVFP4) {
                 // Get scaling value;
-                EP_DEVICE_ASSERT(x_sf_scale != nullptr);
-                SFScaleVal = *(static_cast<const float*>(x_sf_scale));
+                EP_DEVICE_ASSERT(x_global_scales != nullptr);
+                SFScaleVal = *(static_cast<const float*>(x_global_scales));
             }
 
             // FP8 or NVFP4 cast
@@ -537,14 +542,14 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* packed_recv_count,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
-              const float* x_sf_scale,
+              const float* x_global_scales,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
               const void* x, const int64_t* topk_idx,
               int* next_clean, int num_next_clean_int,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
-              bool use_nvfp4, bool use_ue8m0_for_sf,
+              bool use_nvfp4, bool use_ue8m0_for_nvfp4_x_scale,
               void* workspace, int num_device_sms,
               cudaStream_t stream, int phases) {
     constexpr int kNumMaxTopK = 9;
@@ -572,9 +577,9 @@ if (use_fp8 and not use_ue8m0) \
     dispatch_func = dispatch<true, false, false, false, hidden>; \
 if (use_fp8 and use_ue8m0) \
     dispatch_func = dispatch<true, true, false, false, hidden>; \
-if (use_nvfp4 and not use_ue8m0_for_sf) \
+if (use_nvfp4 and not use_ue8m0_for_nvfp4_x_scale) \
     dispatch_func = dispatch<false, false, true, false, hidden>; \
-if (use_nvfp4 and use_ue8m0_for_sf) \
+if (use_nvfp4 and use_ue8m0_for_nvfp4_x_scale) \
     dispatch_func = dispatch<false, false, true, true, hidden>; \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
@@ -582,7 +587,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_count, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
-              x_sf_scale, \
+              x_global_scales, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \

@@ -1091,10 +1091,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Te
 Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
-                             const std::optional<torch::Tensor>& x_sf_scale,
+                             const std::optional<torch::Tensor>& x_global_scales,
                              int num_max_dispatch_tokens_per_rank, int num_experts,
                              bool use_fp8, bool round_scale, bool use_ue8m0,
-                             bool use_nvfp4, bool use_ue8m0_for_sf,
+                             bool use_nvfp4, bool use_ue8m0_for_nvfp4_x_scale,
                              bool async, bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
@@ -1176,9 +1176,12 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         auto m = num_ranks * num_max_dispatch_tokens_per_rank;
         auto rm = (m + 127) / 128;
         auto rk = hidden / (kNumPerChannels * NUM_SF_ELEMS_PER_PACK);
+        auto scale_dtype = use_ue8m0_for_nvfp4_x_scale ?
+            torch::dtype(torch::kUInt8) :
+            torch::dtype(torch::kFloat8_e4m3fn);
         // The physical layout is (l, rm, rk, 32, 4, 4).
         packed_recv_x_scales = torch::empty({l, rm, rk, 32, 4, 4},
-                                            torch::dtype(torch::kUInt8).device(torch::kCUDA));
+                                            scale_dtype.device(torch::kCUDA));
         // After permute, the logical shape is (32, 4, rm, 4, rk, l)
         packed_recv_x_scales = packed_recv_x_scales.value().permute({3, 4, 1, 5, 2, 0});
 
@@ -1194,7 +1197,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
                                packed_recv_count.data_ptr<int>(),
                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
                                dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-                               x_sf_scale.has_value() ? x_sf_scale->data_ptr<float>() : nullptr,
+                               x_global_scales.has_value() ? x_global_scales->data_ptr<float>() : nullptr,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
                                x.data_ptr(), topk_idx.data_ptr<int64_t>(),
@@ -1202,7 +1205,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
                                use_fp8, round_scale, use_ue8m0,
-                               use_nvfp4, use_ue8m0_for_sf,
+                               use_nvfp4, use_ue8m0_for_nvfp4_x_scale,
                                workspace, num_device_sms,
                                launch_stream, phases);
     };
