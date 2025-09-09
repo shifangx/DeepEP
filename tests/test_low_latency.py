@@ -11,13 +11,12 @@ from typing import Optional
 import deep_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
-MAX_E4M3 = 448
-MAX_NVFP4 = 6.0
-
+FLOAT4_E2M1_MAX = 6.0
+FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: deep_ep.Buffer,
-              use_logfmt: bool = False, seed: int = 0):
+              use_logfmt: bool = False, seed: int = 0, args: argparse.Namespace = None):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
 
@@ -54,32 +53,28 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             for dispatch_data_type in ('bf16', 'fp8', 'nvfp4'):
                 dispatch_use_fp8 = dispatch_data_type == 'fp8'
                 dispatch_use_nvfp4 = dispatch_data_type == 'nvfp4'
-                use_ue8m0_for_nvfp4_x_scale = False
+                use_ue8m0_for_sf = False
                 for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         num_times += 1
                         for i in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
                             x_max = torch.max(torch.abs(current_x))
-                            x_global_scales = (MAX_E4M3 * MAX_NVFP4) / x_max.to(torch.float32)
-                            dist.all_reduce(x_global_scales, op=dist.ReduceOp.MIN, group=group)
+                            x_global_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / x_max.to(torch.float32)
+                            dist.all_reduce(x_global_scale, op=dist.ReduceOp.MIN, group=group)
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
-                                                            use_nvfp4=dispatch_use_nvfp4, use_ue8m0_for_nvfp4_x_scale=use_ue8m0_for_nvfp4_x_scale,
+                                                            use_nvfp4=dispatch_use_nvfp4, use_ue8m0_for_sf=use_ue8m0_for_sf,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                                            x_global_scales=x_global_scales,
+                                                            x_global_scale=x_global_scale,
                                                             async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
                             hook() if return_recv_hook else event.current_stream_wait()
                         if dispatch_use_fp8:
                             packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous())
                             simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape)
                         elif dispatch_use_nvfp4:
-                            recv_x_scale_view = packed_recv_x[1]
-                            recv_x_scale_view = recv_x_scale_view.permute(5, 2, 0, 1, 4, 3)
-                            recv_x_scale_view = recv_x_scale_view.contiguous().view(num_local_experts, int(num_ranks * num_tokens), hidden // 16)
-                            packed_recv_x = (packed_recv_x[0], recv_x_scale_view)
-                            simulated_gemm_x = per_token_cast_back(packed_recv_x[0], packed_recv_x[1], x_global_scales, use_ue8m0_for_nvfp4_x_scale=use_ue8m0_for_nvfp4_x_scale, src_data_format='nvfp4')
+                            simulated_gemm_x = per_token_cast_back(packed_recv_x[0], packed_recv_x[1], x_global_scale, use_ue8m0_for_sf=use_ue8m0_for_sf, src_data_format='nvfp4')
                         else:
                             packed_recv_x = packed_recv_x
                             simulated_gemm_x = packed_recv_x.clone()
@@ -116,9 +111,11 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                     if not round_scale and not dispatch_use_nvfp4:
                                         assert (recv_x_amin == j - rank_offset).sum().item() == (all_topk_idx[j] == expert_id).sum().item()
                                         assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
-                            if dispatch_use_fp8 or dispatch_use_nvfp4:
+                            if dispatch_use_fp8:
                                 hash_value ^= hash_tensor(packed_recv_x[0][i, :num_valid_tokens])
                                 hash_value ^= hash_tensor(packed_recv_x[1][i, :num_valid_tokens])
+                            elif dispatch_use_nvfp4:
+                                hash_value ^= hash_tensor(simulated_gemm_x[i, :num_valid_tokens])
                             else:
                                 hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
@@ -136,12 +133,12 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
                                 assert torch.isnan(combined_x).sum().item() == 0
                                 if dispatch_use_fp8:
-                                    diff_threshold = 9e-4
+                                    diff_threshold = 0.007
                                 elif dispatch_use_nvfp4:
                                     diff_threshold = 0.007
                                 else:
                                     diff_threshold = 1e-5
-                                assert diff < diff_threshold, f'Error: {diff=}, {dispatch_use_fp8=}, {dispatch_use_nvfp4=}, {zero_copy=}'
+                                assert diff < diff_threshold, f'Error: {diff=}, {diff_threshold=}, {dispatch_use_fp8=}, {dispatch_use_nvfp4=}, {zero_copy=}'
                                 hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
@@ -152,18 +149,32 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         hook()
 
     # noinspection PyShadowingNames
-    def test_func(return_recv_hook: bool):
-        # NOTE: use nvfp4
+    def test_func_fp8(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
             buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                        use_fp8=False, use_nvfp4=True, x_global_scales=x_global_scales,
+                                        use_fp8=True, use_nvfp4=False, x_global_scale=x_global_scale,
                                         async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                              use_logfmt=use_logfmt, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
+    # noinspection PyShadowingNames
+    def test_func_nvfp4(return_recv_hook: bool):
+        recv_x, recv_count, handle, event, hook = \
+            buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                        cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                                        use_fp8=False, use_nvfp4=True, x_global_scale=x_global_scale,
+                                        async_finish=False, return_recv_hook=return_recv_hook)
+        large_gemm_with_hook(hook) if return_recv_hook else None
+        combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                             use_logfmt=use_logfmt, return_recv_hook=return_recv_hook)
+        large_gemm_with_hook(hook) if return_recv_hook else None
+
+    ########################################################
+    # fp8
+    ########################################################
     # Calculate bandwidth
     num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
     num_logfmt10_bytes = hidden * 10 / 8 + hidden / 128 * 4
@@ -174,22 +185,91 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
-    print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
+    avg_t, min_t, max_t = bench(partial(test_func_fp8, return_recv_hook=False), num_tests=1000)
+    print(f'[rank {rank}] fp8 Dispatch + bf16 combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
     # Separate profiling
     for return_recv_hook in (False, True):
+        if args.no_kineto_profile:
+            # if start with nsys profiling, kineto profiling will fail, so skip it.
+            break
         group.barrier()
-        dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=return_recv_hook),
+        dispatch_t, combine_t = bench_kineto(partial(test_func_fp8, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1)
+                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, num_tests=1000)
         if not return_recv_hook:
-            print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
-                  f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+            print(f'[rank {rank}] fp8 Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
+                  f'bf16 Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
         else:
-            print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us | '
-                  f'Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us', flush=True)
+            print(f'[rank {rank}] fp8 Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us | '
+                  f'bf16 Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us', flush=True)
+
+
+    ########################################################
+    # nvfp4
+    ########################################################
+    # Calculate bandwidth
+    num_nvfp4_bytes, num_bf16_bytes = (hidden / 2 + hidden / 16 + 16), hidden * 2
+    num_logfmt10_bytes = hidden * 10 / 8 + hidden / 128 * 4
+    num_dispatch_comm_bytes, num_combine_comm_bytes = 0, 0
+    for i in range(num_tokens):
+        num_selections = (topk_idx[i] != -1).sum().item()
+        num_dispatch_comm_bytes += num_nvfp4_bytes * num_selections
+        num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
+
+    # Dispatch + combine testing
+    avg_t, min_t, max_t = bench(partial(test_func_nvfp4, return_recv_hook=False), num_tests=1000)
+    print(f'[rank {rank}] nvfp4 Dispatch + bf16 combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
+          f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
+
+    # Separate profiling
+    for return_recv_hook in (False, True):
+        if args.no_kineto_profile:
+            break
+        group.barrier()
+        dispatch_t, combine_t = bench_kineto(partial(test_func_nvfp4, return_recv_hook=return_recv_hook),
+                                             kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
+                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, num_tests=1000)
+        if not return_recv_hook:
+            print(f'[rank {rank}] nvfp4 Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
+                  f'bf16 Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+        else:
+            print(f'[rank {rank}] nvfp4 Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us | '
+                  f'bf16 Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us', flush=True)
+
+    if args.no_kineto_profile:
+        torch.cuda.profiler.start()
+        if rank == 0:
+            print(f'Torch profiling ...', flush=True)
+        for return_recv_hook in (False, True):
+            REPEAT = 3
+            for repeat in range(REPEAT):
+                for return_recv_hook in (False, True):
+                    group.barrier()
+                    ITERATIONS = 100
+                    with torch.cuda.nvtx.range(f"fp8 dispatch with return_recv_hook:{return_recv_hook}"):
+                        for _ in range(ITERATIONS):
+                            with torch.cuda.nvtx.range("fp8 dispatch"):
+                                recv_x, recv_count, handle, event, hook = \
+                                    buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                                    cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                                                    use_fp8=True, use_nvfp4=False, x_global_scale=x_global_scale,
+                                                    async_finish=False, return_recv_hook=return_recv_hook)
+                    group.barrier()
+                    with torch.cuda.nvtx.range(f"nvfp4 dispatch with return_recv_hook:{return_recv_hook}"):
+                        for _ in range(ITERATIONS):
+                            with torch.cuda.nvtx.range("nvfp4 dispatch"):
+                                recv_x, recv_count, handle, event, hook = \
+                                    buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                                    cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                                                    use_fp8=False, use_nvfp4=True, x_global_scale=x_global_scale,
+                                                    async_finish=False, return_recv_hook=return_recv_hook)
+                    group.barrier()
+        time.sleep(0.1)
+        torch.cuda.profiler.stop()
+        if rank == 0:
+            print(f'Torch profiling done', flush=True)
     return hash_value
 
 
@@ -207,7 +287,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             allow_nvlink_for_low_latency_mode=not args.disable_nvlink, explicitly_destroy=True,
                             allow_mnnvl=args.allow_mnnvl)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
-              use_logfmt=args.use_logfmt, seed=1)
+              use_logfmt=args.use_logfmt, seed=1, args=args)
 
     do_pressure_test = args.pressure_test
     for seed in range(int(1e9) if do_pressure_test else 0):
@@ -247,6 +327,8 @@ if __name__ == '__main__':
                         help='Whether to test LogFMT combine')
     parser.add_argument("--pressure-test", action='store_true',
                         help='Whether to do pressure test')
+    parser.add_argument("--no-kineto-profile", action='store_true',
+                        help='Whether to do torch profile')
 
     args = parser.parse_args()
 

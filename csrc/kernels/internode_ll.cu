@@ -200,7 +200,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* packed_recv_count,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
-         const float* x_global_scales,
+         const float* x_global_scale,
          void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
@@ -275,8 +275,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             float SFScaleVal = 1.0f;
             if constexpr (kUseNVFP4) {
                 // Get scaling value;
-                EP_DEVICE_ASSERT(x_global_scales != nullptr);
-                SFScaleVal = *(static_cast<const float*>(x_global_scales));
+                EP_DEVICE_ASSERT(x_global_scale != nullptr);
+                SFScaleVal = *(static_cast<const float*>(x_global_scale));
             }
 
             // FP8 or NVFP4 cast
@@ -517,21 +517,28 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
             } else if constexpr (kUseNVFP4) {            
-                 // The physical layout is (l, rm, rk, 32, 4, 4).
+                 // The physical layout is (l, rm, rk, 32, 4, 4)
                 const auto src_scales = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
-                const auto token_stride = num_scales * sizeof(scale_t);
-                const auto pack_stride = num_elems_per_pack;
-                const auto rm = token_idx / 128;
-                const auto rm_res = token_idx % 128;
+                
+                const auto padded_k = (kHidden + (kNumPerChannels * num_elems_per_pack) -1 ) / (kNumPerChannels * num_elems_per_pack);
+                const auto dim0_stride = 128 * padded_k / kNumPerChannels;
+                const auto dim1_stride = 128 * num_elems_per_pack;
+                const auto dim2_stride = 4 * num_elems_per_pack;
+                const auto dim3_stride = num_elems_per_pack;
+
+                const auto dim0_offset = token_idx / 128;
+                const auto dim2_offset = (token_idx % 128) % 32;
+                const auto dim3_offset = (token_idx % 128) / 32;
+
                 #pragma unroll
                 for (int j = lane_id; j < num_scales; j += 32) {
-                    const auto pack_idx = j / num_elems_per_pack;
-                    const auto elem_idx = j % num_elems_per_pack;
+                    const auto dim1_offset = j / num_elems_per_pack;
+                    const auto dim4_offset = j % num_elems_per_pack;
                     auto scale = ld_nc_global(src_scales + j);
-                    // recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;                   
-                    recv_x_scales[rm * token_stride * 128 + pack_idx * pack_stride * 128 + rm_res * pack_stride + elem_idx] = scale;
+                    const auto offset = dim0_offset * dim0_stride + dim1_offset * dim1_stride + dim2_offset * dim2_stride + dim3_offset * dim3_stride + dim4_offset;
+                    recv_x_scales[offset] = scale;
                 }
             }
         }
@@ -543,14 +550,14 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* packed_recv_count,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
-              const float* x_global_scales,
+              const float* x_global_scale,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
               const void* x, const int64_t* topk_idx,
               int* next_clean, int num_next_clean_int,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
               bool use_fp8, bool round_scale, bool use_ue8m0,
-              bool use_nvfp4, bool use_ue8m0_for_nvfp4_x_scale,
+              bool use_nvfp4, bool use_ue8m0_for_sf,
               void* workspace, int num_device_sms,
               cudaStream_t stream, int phases) {
     constexpr int kNumMaxTopK = 9;
@@ -578,9 +585,9 @@ if (use_fp8 and not use_ue8m0) \
     dispatch_func = dispatch<true, false, false, false, hidden>; \
 if (use_fp8 and use_ue8m0) \
     dispatch_func = dispatch<true, true, false, false, hidden>; \
-if (use_nvfp4 and not use_ue8m0_for_nvfp4_x_scale) \
+if (use_nvfp4 and not use_ue8m0_for_sf) \
     dispatch_func = dispatch<false, false, true, false, hidden>; \
-if (use_nvfp4 and use_ue8m0_for_nvfp4_x_scale) \
+if (use_nvfp4 and use_ue8m0_for_sf) \
     dispatch_func = dispatch<false, false, true, true, hidden>; \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
@@ -588,7 +595,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_count, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
-              x_global_scales, \
+              x_global_scale, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
