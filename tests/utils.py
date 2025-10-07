@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import inspect
 import json
 import tempfile
@@ -43,23 +44,34 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
     return (1 - sim).item()
 
 
+def align_up(x, y):
+    return (x + y - 1) // y * y
+
+
 def per_token_cast_to_fp8(x: torch.Tensor):
-    assert x.dim() == 2 and x.size(1) % 128 == 0
+    assert x.dim() == 2
     m, n = x.shape
-    x_view = x.view(m, -1, 128)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
+    aligned_n = align_up(n, 128)
+    x_padded = torch.nn.functional.pad(x, (0, aligned_n - n), mode='constant', value=0)
+    x_padded_view = x_padded.view(m, -1, 128)
+    x_amax = x_padded_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    return (x_padded_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)
 
     
 def cast_fp8_to_bf16(x_fp8: torch.Tensor, x_scales: torch.Tensor):
     if x_fp8.numel() == 0:
         return x_fp8.to(torch.bfloat16)
+
+    assert x_fp8.dim() == 2
+    m, n = x_fp8.shape
+    aligned_n = align_up(n, 128)
+    x_fp8_padded = torch.nn.functional.pad(x_fp8, (0, aligned_n - n), mode='constant', value=0)
     if x_scales.dtype == torch.int:
         x_scales = x_scales.view(dtype=torch.uint8).to(torch.int) << 23
         x_scales = x_scales.view(dtype=torch.float)
-    x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 128)
+    x_fp32_padded = x_fp8_padded.to(torch.float32).view(x_fp8.size(0), -1, 128)
     x_scales = x_scales.view(x_fp8.size(0), -1, 1)
-    return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)
+    return (x_fp32_padded * x_scales).view(x_fp8_padded.shape).to(torch.bfloat16)[:,:n].contiguous()
 
 def get_global_token_idxs(recv_count: torch.Tensor, recv_src_info: torch.Tensor, recv_layout_range: torch.Tensor, num_local_experts: int, num_ranks: int, num_tokens: int):
     rank = dist.get_rank()
@@ -292,7 +304,7 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
-        schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
+        schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
             for i in range(2):
                 # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
@@ -353,3 +365,127 @@ def bench_kineto(fn, kernel_names: Union[str, tuple], num_tests: int = 30, suppr
 
 def hash_tensor(t: torch.Tensor):
     return t.view(torch.int).sum().item()
+
+
+class TorchRef:
+    def __init__(
+        self,
+        ep_group: torch.distributed.ProcessGroup,
+        num_of_experts: int,
+        num_of_ranks_per_node: int,
+    ):
+        self.ep_group = ep_group
+        self.group_rank = torch.distributed.get_rank(self.ep_group)
+        self.group_size = torch.distributed.get_world_size(self.ep_group)
+        self.num_of_ranks_per_node = num_of_ranks_per_node
+        # at least one node
+        self.num_of_nodes = max(1, self.group_size // self.num_of_ranks_per_node)
+        self.local_rank = self.group_rank % self.num_of_ranks_per_node
+
+        self.num_of_experts = num_of_experts
+        self.num_local_experts = num_of_experts // self.num_of_ranks_per_node
+
+    def _local_expert_range(self):
+        start = self.local_rank * self.num_local_experts
+        end = start + self.num_local_experts  # [start, end)
+        return start, end
+
+    def _select_local_tokens(
+        self,
+        global_hidden: torch.Tensor,
+        global_probs: torch.Tensor,
+        global_scaling_factor: torch.Tensor | None,
+        global_routing_map: torch.Tensor,
+    ):
+        start, end = self._local_expert_range()
+        row_mask = global_routing_map[:, start:end].any(dim=1)
+
+        dispatched_hidden = global_hidden[row_mask]
+        dispatched_probs = (
+            global_probs[row_mask, start:end] if global_probs is not None else None
+        )
+        dispatched_scaling_factor = (
+            global_scaling_factor[row_mask]
+            if global_scaling_factor is not None
+            else None
+        )
+
+        return (
+            dispatched_hidden,
+            dispatched_probs,
+            dispatched_scaling_factor,
+        )
+
+    def dispatch(
+        self,
+        hidden: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor = None,
+        scaling_factor: torch.Tensor = None,
+    ):
+        seq_len, hidden_dim = hidden.shape
+        # Cache sizes for combine
+        self._last_seq_len = seq_len
+        self._last_hidden_dim = hidden_dim
+        # gather the routing map
+        global_routing_map = torch.empty(
+            seq_len * self.group_size,
+            self.num_of_experts,
+            device=hidden.device,
+            dtype=torch.bool,
+        )
+        torch.distributed.all_gather_into_tensor(
+            global_routing_map, routing_map, self.ep_group
+        )
+
+        # dispatch the hidden tensor
+        global_hidden = torch.empty(
+            seq_len * self.group_size,
+            hidden_dim,
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+        torch.distributed.all_gather_into_tensor(global_hidden, hidden, self.ep_group)
+
+        # dispatch the probs tensor
+        if probs is not None:
+            global_probs = torch.empty(
+                seq_len * self.group_size,
+                self.num_of_experts,
+                device=probs.device,
+                dtype=probs.dtype,
+            )
+            torch.distributed.all_gather_into_tensor(global_probs, probs, self.ep_group)
+        else:
+            global_probs = None
+
+        # dispatch the scaling factor tensor
+        if scaling_factor is not None:
+            global_scaling_factor = torch.empty(
+                seq_len * self.group_size,
+                hidden_dim // 128,
+                device=scaling_factor.device,
+                dtype=scaling_factor.dtype,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_scaling_factor, scaling_factor, self.ep_group
+            )
+        else:
+            global_scaling_factor = None
+
+        (
+            dispatched_hidden,
+            dispatched_probs,
+            dispatched_scaling_factor,
+        ) = self._select_local_tokens(
+            global_hidden=global_hidden,
+            global_probs=global_probs,
+            global_scaling_factor=global_scaling_factor,
+            global_routing_map=global_routing_map,
+        )
+
+        return (
+            dispatched_hidden,
+            dispatched_probs,
+            dispatched_scaling_factor,
+        )
