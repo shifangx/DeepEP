@@ -9,7 +9,7 @@ import os
 import sys
 import torch
 import torch.distributed as dist
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 BLOCK_SIZE = 16
 def init_dist(local_rank: int, num_local_ranks: int):
@@ -111,6 +111,33 @@ def recover_experts_swizzled_scales(scale, l, m, n):
     for i in range(l):
         recovered_tensor[i] = recover_swizzled_scales(scale[i], m, n)
     return recovered_tensor
+def quantize_bfloat16_to_nvfp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and x.size(1) % 16 == 0
+    m, n = x.shape
+    x_global_amax = x.abs().float().amax(dim=1).view(m, -1).clamp(1e-4)
+    sf_scales = (6.0 * 448.0) / x_global_amax
+    x_global_quantized = (x * sf_scales).view(m, n)
+    x_view = x_global_quantized.view(m, -1, 16)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    x_quantized = (x_view * (6.0 / x_amax.unsqueeze(2))).view(m, n)
+    x_nvfp4_packed = pack_8xnvfp4_to_int32(x_quantized)
+    x_scales = (x_amax / 6.0).view(m, -1)
+    return x_nvfp4_packed, x_scales.to(torch.float8_e4m3fn).view(dtype=torch.int32), sf_scales
+
+def pack_8xnvfp4_to_int32(x: torch.Tensor) -> torch.Tensor:
+    num_tokens, hidden = x.shape
+    NVFP4_TABLE = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32, device=x.device)
+    NVFP4_INTREPL = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32, device=x.device)
+    sign = (x < 0).to(torch.int32)
+    diff = (x.abs().unsqueeze(-1) - NVFP4_TABLE.view(1, 1, 8)).abs()
+    idx = diff.argmin(dim=-1)
+    repl = NVFP4_INTREPL[idx]
+    int32_elm = ((sign << 3) + repl)
+    int32_elm = int32_elm.reshape(num_tokens, hidden // 8, 8)
+    shift = int32_elm << torch.tensor([28, 24, 20, 16, 12, 8, 4, 0], dtype=torch.int32, device=x.device)
+    uint32_shift = shift.view(dtype=torch.uint32)
+    final = uint32_shift.sum(dim=-1).to(dtype=torch.uint32).view(dtype=torch.int32)
+    return final
 
 def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
     """
@@ -129,6 +156,7 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
 
     result = []
     for i in range(8):
+        # most significant byte is the first element is in the result list
         shift = (7 - i) * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
@@ -157,6 +185,7 @@ def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
 
     result = []
     for i in range(2):
+        # most significant byte is the last element is in the result list
         shift = i * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
@@ -205,6 +234,24 @@ def per_token_cast_back(x: torch.Tensor, x_scales: torch.Tensor, x_global_scale:
     else:
         raise ValueError(f"Unsupported src_data_format: {src_data_format}")
 
+def dequantize_nvfp4_back_to_bfloat16(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_sf_scale: torch.Tensor, use_ue8m0_for_nvfp4_sf: bool = False):
+    NVFP4_TABLE = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1.0, -1.5, -2, -3, -4, -6], dtype=torch.float32, device=x_nvfp4.device)   
+    if use_ue8m0_for_nvfp4_sf:
+        x_scales = x_scales.view(dtype=torch.int8).to(torch.int) << 23
+        x_scales = x_scales.view(dtype=torch.float)
+    else:
+        x_scales = x_scales.view(dtype=torch.float8_e4m3fn).to(torch.float32)
+    x_sf_scale = 1 / x_sf_scale
+    x_scales = x_scales * x_sf_scale
+    
+    x_fp32 = int32_to_8floats_lookup(x_nvfp4, NVFP4_TABLE)
+    
+    x_fp32 = x_fp32.view(*x_fp32.shape[:-1], -1, 16)
+    x_scales = x_scales.view(*x_scales.shape[:-1], -1, 1)
+    x_fp32 = x_fp32 * x_scales
+    x_fp32 = x_fp32.view(*x_nvfp4.shape[:-1], -1).to(torch.bfloat16)
+
+    return x_fp32
 
 def inplace_unique(x: torch.Tensor, num_slots: int):
     assert x.dim() == 2
@@ -369,6 +416,39 @@ def hash_tensor(t: torch.Tensor):
     return t.view(torch.int).sum().item()
 
 
+def permute(
+    tokens,
+    routing_map,
+    scaling_factor: torch.Tensor = None,
+    probs: torch.Tensor = None,
+    num_out_tokens: int = None,
+):
+    num_tokens, hidden = tokens.shape
+    num_experts = routing_map.shape[1]
+    permuted_probs = None
+
+    # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+    routing_map = routing_map.bool().T.contiguous()
+
+    # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
+    token_indices = (
+        torch.arange(num_tokens, device=routing_map.device)
+        .unsqueeze(0)
+        .expand(num_experts, -1)
+    )
+
+    sorted_indices = token_indices.masked_select(routing_map)
+
+    if probs is not None:
+        permuted_probs = probs.T.contiguous().masked_select(routing_map)
+
+    # use the mapping to permute the tokens
+    permuted_input = tokens.index_select(0, sorted_indices)
+    permuted_scaling_factor = scaling_factor.index_select(0, sorted_indices)
+
+    return permuted_input, permuted_probs, permuted_scaling_factor
+
+
 class TorchRef:
     def __init__(
         self,
@@ -424,6 +504,10 @@ class TorchRef:
         routing_map: torch.Tensor,
         probs: torch.Tensor = None,
         scaling_factor: torch.Tensor = None,
+        local_expert_routing_map: torch.Tensor = None,
+        out_token_num: int = None,
+        enable_permute: bool = False,
+        pad_multiple: int = 0,
     ):
         seq_len, hidden_dim = hidden.shape
         # Cache sizes for combine
@@ -485,6 +569,76 @@ class TorchRef:
             global_scaling_factor=global_scaling_factor,
             global_routing_map=global_routing_map,
         )
+
+        if enable_permute:
+            dispatched_hidden, dispatched_probs, dispatched_scaling_factor = permute(
+                dispatched_hidden,
+                local_expert_routing_map,
+                dispatched_scaling_factor,
+                dispatched_probs,
+                out_token_num,
+            )
+
+            if pad_multiple > 0:
+                token_per_expert = local_expert_routing_map.sum(dim=0)
+                padd_m_split = [
+                    (i + pad_multiple - 1) // pad_multiple * pad_multiple
+                    for i in token_per_expert
+                ]
+
+                device = dispatched_hidden.device
+                dtype = dispatched_hidden.dtype
+                hidden_dim = dispatched_hidden.shape[1]
+
+                padded_hidden_list = []
+                padded_probs_list = [] if dispatched_probs is not None else None
+                padded_scaling_list = (
+                    [] if dispatched_scaling_factor is not None else None
+                )
+
+                start_idx = 0
+                for expert_idx, (actual_tokens, padded_tokens) in enumerate(
+                    zip(token_per_expert.tolist(), padd_m_split)
+                ):
+                    end_idx = start_idx + int(actual_tokens)
+                    padding_size = padded_tokens - int(actual_tokens)
+
+                    # pad token
+                    expert_hidden = dispatched_hidden[start_idx:end_idx]
+                    pad_hidden = torch.zeros(
+                        padding_size, hidden_dim, device=device, dtype=dtype
+                    )
+                    expert_hidden = torch.cat([expert_hidden, pad_hidden], dim=0)
+                    padded_hidden_list.append(expert_hidden)
+
+                    # pad probs
+                    if dispatched_probs is not None:
+                        expert_probs = dispatched_probs[start_idx:end_idx]
+                        pad_probs = torch.zeros(
+                            padding_size, device=device, dtype=dispatched_probs.dtype
+                        )
+                        expert_probs = torch.cat([expert_probs, pad_probs], dim=0)
+                        padded_probs_list.append(expert_probs)
+
+                    # pad scaling factor
+                    if dispatched_scaling_factor is not None:
+                        expert_scaling = dispatched_scaling_factor[start_idx:end_idx]
+                        pad_scaling = torch.zeros(
+                            padding_size,
+                            hidden_dim // 128,
+                            device=device,
+                            dtype=dispatched_scaling_factor.dtype,
+                        )
+                        expert_scaling = torch.cat([expert_scaling, pad_scaling], dim=0)
+                        padded_scaling_list.append(expert_scaling)
+
+                    start_idx = end_idx
+
+                dispatched_hidden = torch.cat(padded_hidden_list, dim=0)
+                if dispatched_scaling_factor is not None:
+                    dispatched_scaling_factor = torch.cat(padded_scaling_list, dim=0)
+                if dispatched_probs is not None:
+                    dispatched_probs = torch.cat(padded_probs_list, dim=0)
 
         return (
             dispatched_hidden,

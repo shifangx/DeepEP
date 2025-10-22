@@ -35,6 +35,43 @@ inline int get_token_data_type_size(TOKEN_DATA_TYPE token_data_type) {
   return 0;
 }
 
+struct DispatchBuffers {
+  TOKEN_DATA_TYPE data_type;
+  // Output buffers to experts
+  void *expert_output_token;
+  void **expert_output_token_all_ranks;
+  float *expert_output_prob;
+  float **expert_output_prob_all_ranks;
+  float *expert_output_scaling_factor;
+  float **expert_output_scaling_factor_all_ranks;
+  // Local temp buffer for dispatch kernel.
+  void *rdma_inter_node_group_token;
+  float *rdma_inter_node_group_prob;
+  float *rdma_inter_node_group_scaling_factor;
+  uint64_t *rdma_inter_node_group_flags;
+  // Misc flags
+  uint32_t *intra_node_write_completion_flags;
+  uint64_t *expected_rdma_flag_value;
+  uint32_t *expected_intra_node_flag_value;
+};
+
+struct CombineBuffers {
+  // Input buffers from experts
+  uint16_t *expert_input_token;
+  uint16_t **expert_input_token_all_ranks;
+  float *expert_input_prob;
+  float **expert_input_prob_all_ranks;
+  // Local temp buffer for combine kernel.
+  uint16_t *rdma_intra_node_red_token; 
+  float *rdma_intra_node_red_prob;
+  uint16_t *rdma_inter_node_group_token;
+  float *rdma_inter_node_group_prob; 
+  uint64_t *rdma_inter_node_group_flags; 
+  // Misc flags
+  uint32_t *intra_node_write_completion_flags;
+  uint64_t *expected_rdma_flag_value;
+  uint32_t *expected_intra_node_flag_value; 
+};
 
 __device__ __forceinline__ bool elect_sync(uint32_t membermask) {
     uint32_t is_elected;
@@ -124,4 +161,42 @@ inline std::string convert_to_nvcc_arch_flags(std::string torch_arch_list) {
   }
 
   return nvcc_arch_flags;
+}
+
+template <typename T>
+inline bool grow_to(T& dst, const T& src) {
+  if (dst < src) { dst = src; return true; }
+  return false;
+}
+
+inline void print_ptr_info(void* p) {
+  cudaPointerAttributes attr{};
+  cudaError_t err = cudaPointerGetAttributes(&attr, p);
+  if (err != cudaSuccess) {
+    printf("cudaPointerGetAttributes failed: %s\n", cudaGetErrorString(err));
+    return;
+  }
+  cudaMemoryType memory_type;
+#if CUDART_VERSION >= 10000
+  memory_type = attr.type;
+#else
+  memory_type = attr.memoryType;
+#endif
+  std::string memory_type_str;
+  switch (memory_type) {
+    case cudaMemoryTypeHost: memory_type_str = "Host"; break;
+    case cudaMemoryTypeDevice: memory_type_str = "Device"; break;
+    case cudaMemoryTypeManaged: memory_type_str = "Managed"; break;
+    default: memory_type_str = "Unregistered/Unknown"; break;
+  }
+  printf("type=%s, device=%d\n", memory_type_str.c_str(), attr.device);
+
+  // If this is a device/managed pointer, try to query its allocation range (base + size)
+  if (memory_type == cudaMemoryTypeDevice || memory_type == cudaMemoryTypeManaged) {
+    cuInit(0);
+    CUdeviceptr base = 0;
+    size_t size = 0;
+    CUresult r = cuMemGetAddressRange(&base, &size, reinterpret_cast<CUdeviceptr>(p));
+    printf("alloc_base=%p, alloc_size=%zu bytes\n", reinterpret_cast<void*>(base), size);
+  }
 }
