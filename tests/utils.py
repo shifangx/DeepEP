@@ -129,7 +129,7 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
 
     result = []
     for i in range(8):
-        shift = i * 4
+        shift = (7 - i) * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
         result.append(val)
@@ -140,25 +140,26 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
     return out
 
 
-def uint8_to_2floats_lookup(tensor: torch.Tensor) -> torch.Tensor:
+def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
     """
     Decomposes each uint8 in the input tensor into 2 4-bit values,
     and converts them into float values using a lookup table.
 
     Args:
-        tensor: (uint8 Tensor) Tensor of any shape, e.g., [B, N]
+        tensor: (uint8 Tensor) Tensor of any shape, e.g., [B, M]
+        table: (float Tensor) A 1D lookup table of length 16 that maps all 4-bit values to floats
 
     Returns:
-        float32 Tensor: Merges the last two dimensions, so shape is [..., n*M], where n is the number of uint8 and 2 per uint8.
+        float32 Tensor: Merges the last two dimensions, so shape is [..., n*M], where n is 2, 
+        which isthe number of 4-bit values per uint8.
     """
-    NVFP4_TABLE = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1.0, -1.5, -2, -3, -4, -6], dtype=torch.float32, device='cuda')
     assert tensor.dtype == torch.uint8, "Input must be of uint8 type"
 
     result = []
     for i in range(2):
-        shift = i * 4
+        shift = (1 - i) * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
-        val = NVFP4_TABLE[idx].unsqueeze(-1)  # Lookup and preserve dimensions
+        val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
         result.append(val)
 
     out = torch.cat(result, dim=-1)  # Output shape: [..., 2]
@@ -168,6 +169,7 @@ def uint8_to_2floats_lookup(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def cast_nvfp4_to_bf16(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_global_scale: float, use_ue8m0_for_sf: bool = False):
+    NVFP4_TABLE = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1.0, -1.5, -2, -3, -4, -6], dtype=torch.float32, device=x_nvfp4.device)  
     assert x_nvfp4.dtype == torch.uint8, "Input must be of int8 type, but got " + str(x_nvfp4.dtype)
     assert x_scales.ndim == 6, "Input scales must be of 6 dimensions"
     assert x_scales.shape[0] == 32 and x_scales.shape[1] == 4 and x_scales.shape[3] == 4, "Input scales shape must be [32, 4, rm, 4, rk, l]"
@@ -185,7 +187,7 @@ def cast_nvfp4_to_bf16(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_global_s
         x_scales = x_scales.to(torch.float32)
     x_scales = x_scales * (1 / x_global_scale)
     
-    x_fp32 = uint8_to_2floats_lookup(x_nvfp4).to(torch.float32)
+    x_fp32 = uint8_to_2floats_lookup(x_nvfp4, NVFP4_TABLE).to(torch.float32)
     x_scales_view = x_scales.permute(5, 2, 4, 0, 1, 3).view(l, rm, -1)
     x_scales_view_recover = torch.empty((l, rm*128, rk*4), dtype=torch.float32, device=x_scales.device)
     for i in range(l):
