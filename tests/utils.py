@@ -190,9 +190,9 @@ def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor, msb_first
     result = []
     for i in range(2):
         if msb_first:
-            shift = i * 4
-        else:
             shift = (1 - i) * 4
+        else:
+            shift = i * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
         result.append(val)
