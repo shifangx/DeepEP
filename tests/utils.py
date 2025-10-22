@@ -139,7 +139,7 @@ def pack_8xnvfp4_to_int32(x: torch.Tensor) -> torch.Tensor:
     final = uint32_shift.sum(dim=-1).to(dtype=torch.uint32).view(dtype=torch.int32)
     return final
 
-def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor, msb_first: bool = True) -> torch.Tensor:
     """
     Decomposes each int32 in the input tensor into 8 4-bit values,
     and converts them into float values using a lookup table.
@@ -147,6 +147,7 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
     Args:
         tensor: (int32 Tensor) Tensor of any shape, e.g., [B, N]
         table: (float Tensor) A 1D lookup table of length 16 that maps all 4-bit values to floats
+        msb_first: (bool) Whether the most significant 4 bytes should be put at the first element in the result list
 
     Returns:
         float32 Tensor: Merges the last two dimensions, so shape is [..., n*M], where n is the number of int32 and 8 per int32.
@@ -156,8 +157,10 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
 
     result = []
     for i in range(8):
-        # most significant byte is the first element is in the result list
-        shift = (7 - i) * 4
+        if msb_first:
+            shift = (7 - i) * 4
+        else:
+            shift = i * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
         result.append(val)
@@ -168,7 +171,7 @@ def int32_to_8floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
     return out
 
 
-def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor, msb_first: bool = True) -> torch.Tensor:
     """
     Decomposes each uint8 in the input tensor into 2 4-bit values,
     and converts them into float values using a lookup table.
@@ -176,6 +179,7 @@ def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
     Args:
         tensor: (uint8 Tensor) Tensor of any shape, e.g., [B, M]
         table: (float Tensor) A 1D lookup table of length 16 that maps all 4-bit values to floats
+        msb_first: (bool) Whether the most significant 4 bytes should be put at the first element in the result list
 
     Returns:
         float32 Tensor: Merges the last two dimensions, so shape is [..., n*M], where n is 2, 
@@ -185,8 +189,10 @@ def uint8_to_2floats_lookup(tensor: torch.Tensor, table: torch.Tensor) -> torch.
 
     result = []
     for i in range(2):
-        # most significant byte is the last element is in the result list
-        shift = i * 4
+        if msb_first:
+            shift = i * 4
+        else:
+            shift = (1 - i) * 4
         idx = ((tensor >> shift) & 0xF).long()  # Extract 4-bit index [0, 15]
         val = table[idx].unsqueeze(-1)  # Lookup and preserve dimensions
         result.append(val)
@@ -216,7 +222,7 @@ def cast_nvfp4_to_bf16(x_nvfp4: torch.Tensor, x_scales: torch.Tensor, x_global_s
         x_scales = x_scales.to(torch.float32)
     x_scales = x_scales * (1 / x_global_scale)
     
-    x_fp32 = uint8_to_2floats_lookup(x_nvfp4, NVFP4_TABLE).to(torch.float32)
+    x_fp32 = uint8_to_2floats_lookup(x_nvfp4, table=NVFP4_TABLE, msb_first=False).to(torch.float32)
     x_scales_view = x_scales.permute(5, 2, 4, 0, 1, 3).view(l, rm, -1)
     x_scales_view_recover = torch.empty((l, rm*128, rk*4), dtype=torch.float32, device=x_scales.device)
     for i in range(l):
