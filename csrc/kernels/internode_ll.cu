@@ -522,7 +522,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
                 
-                const auto rk = align<int>(kHidden / kNumPerChannels, 4) / 4;
+                const auto rk = align_up<int>(kHidden / kNumPerChannels, 4) / 4;
                 const auto dim0_stride = rk * 128 * num_elems_per_pack;
                 const auto dim1_stride = 128 * num_elems_per_pack;
                 const auto dim2_stride = 4 * num_elems_per_pack;
