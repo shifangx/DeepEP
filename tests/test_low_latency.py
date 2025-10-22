@@ -185,7 +185,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func_fp8, return_recv_hook=False), num_tests=1000)
+    avg_t, min_t, max_t = bench(partial(test_func_fp8, return_recv_hook=False))
     print(f'[rank {rank}] fp8 Dispatch + bf16 combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
@@ -197,7 +197,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         group.barrier()
         dispatch_t, combine_t = bench_kineto(partial(test_func_fp8, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, num_tests=1000)
+                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1)
         if not return_recv_hook:
             print(f'[rank {rank}] fp8 Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                   f'bf16 Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
@@ -219,7 +219,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func_nvfp4, return_recv_hook=False), num_tests=1000)
+    avg_t, min_t, max_t = bench(partial(test_func_nvfp4, return_recv_hook=False))
     print(f'[rank {rank}] nvfp4 Dispatch + bf16 combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
@@ -230,7 +230,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         group.barrier()
         dispatch_t, combine_t = bench_kineto(partial(test_func_nvfp4, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1, num_tests=1000)
+                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1)
         if not return_recv_hook:
             print(f'[rank {rank}] nvfp4 Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                   f'bf16 Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
